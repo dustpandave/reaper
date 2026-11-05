@@ -45,7 +45,7 @@ dofile(reaper.GetResourcePath() .. "/Scripts/AgentBridge.lua")
   "mcpServers": {
     "reaper": {
       "command": "/Users/YOU/.local/bin/uvx",
-      "args": ["--from", "git+https://github.com/OWNER/reaper-agent", "reaper-agent"]
+      "args": ["--from", "git+https://github.com/dustpandave/reaper", "reaper-agent"]
     }
   }
 }
@@ -58,7 +58,7 @@ Use the full path to `uvx` (`which uvx` prints it) since Claude Desktop doesn't 
 ### Claude Code
 
 ```bash
-claude mcp add reaper -- uvx --from git+https://github.com/OWNER/reaper-agent reaper-agent
+claude mcp add reaper -- uvx --from git+https://github.com/dustpandave/reaper reaper-agent
 ```
 
 ## Working with ideas
