@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import functools
 import random
+from pathlib import Path
 from typing import Annotated, Literal
 
 import anyio
@@ -28,6 +29,10 @@ Conventions:
 For writing complementary parts: read_midi on existing parts first (it returns key and chord
 estimates), then either compose notes yourself with insert_midi or start from generate_part and edit.
 Put new ideas on new tracks named clearly (e.g. "Idea - Counter melody") rather than overwriting.
+
+Sound effects come from the user's local Soundly library. Search with several phrasings at once
+(search_sounds), check the best few with inspect_sounds when the description alone is ambiguous,
+then offer two or three options and place the chosen one with place_sound.
 """
 
 mcp = MCPServer("reaper-agent", instructions=INSTRUCTIONS)
@@ -286,6 +291,141 @@ async def import_audio(track: TrackRef, path: str, start_beat: float | None = No
 
 
 # ---------------------------------------------------------------------------
+# Soundly sound library
+# ---------------------------------------------------------------------------
+
+async def _resolve_beat(start_beat: float | None, at_marker: str | None, offset_beats: float) -> float | None:
+    if at_marker:
+        markers = await call("list_markers")
+        want = at_marker.lower()
+        hit = next((m for m in markers if m["name"].lower() == want), None) or \
+            next((m for m in markers if want in m["name"].lower()), None)
+        if not hit:
+            raise ValueError(f"no marker or region named '{at_marker}'")
+        return hit["position_beat"] + offset_beats
+    return None if start_beat is None else start_beat + offset_beats
+
+
+async def _ensure_track(name: str | int) -> str | int:
+    if isinstance(name, int):
+        return name
+    proj = await call("get_project")
+    if not any(t["name"].lower() == name.lower() for t in proj["tracks"]):
+        await call("add_track", name=name)
+    return name
+
+
+def _soundly():
+    from .soundly import SoundlyDB
+    try:
+        return SoundlyDB()
+    except FileNotFoundError as e:
+        raise ValueError(str(e)) from e
+
+
+@tool
+async def search_sounds(
+    queries: Annotated[list[str], Field(min_length=1, description=(
+        "2-5 phrasings of what you're after: the user's words, synonyms, how a sound editor would "
+        "describe it, and UCS-style terms. E.g. ['big whoosh transition', 'swish pass by fast', 'air swoosh'].")) ],
+    max_length: float | None = None,
+    min_length: float | None = None,
+    category: str | None = None,
+    fmt: str | None = None,
+    min_sample_rate: int | None = None,
+    channels: int | None = None,
+    limit: int = 25,
+) -> list:
+    """Search the user's local Soundly library. Results found by several phrasings rank higher.
+
+    Pass several `queries` rather than one literal string: the library's own wording varies
+    ('swish' vs 'whoosh', 'footsteps' vs 'feet'). Durations are seconds; `category` matches the
+    UCS CategoryID (e.g. 'WHSH', 'ANMLDog'; see list_sound_categories). If results look off,
+    try inspect_sounds on the top candidates before recommending them.
+    """
+    def run():
+        with _soundly() as db:
+            return db.search(queries, limit=limit, max_length=max_length, min_length=min_length,
+                             category=category, fmt=fmt, min_sample_rate=min_sample_rate, channels=channels)
+    return await anyio.to_thread.run_sync(run)
+
+
+@tool
+async def list_sound_categories() -> dict:
+    """UCS categories in the Soundly library with counts, plus the libraries being indexed."""
+    def run():
+        with _soundly() as db:
+            return {"indexed_sounds": db.count(), "libraries": db.libraries(), "categories": db.categories()}
+    return await anyio.to_thread.run_sync(run)
+
+
+@tool
+async def inspect_sounds(sound_ids: list[int]) -> list:
+    """'Listen' to candidates: loudness, length, stereo width and spectral balance for each sound file.
+
+    Use it to check a description against reality, e.g. that a 'low rumble' really sits in the
+    sub/low bands, or to pick the punchiest of several hits (higher crest factor = more transient).
+    """
+    from .analysis import analyze_audio
+
+    def run():
+        out = []
+        with _soundly() as db:
+            for sid in sound_ids[:20]:
+                s = db.get(sid)
+                if not s:
+                    out.append({"Id": sid, "error": "not found"})
+                    continue
+                entry = {"Id": sid, "Description": s["Description"]}
+                try:
+                    a = analyze_audio(s["Location"])
+                    entry.update({k: a.get(k) for k in ("duration_s", "integrated_lufs", "sample_peak_dbfs",
+                                  "crest_factor_db", "stereo_correlation", "spectral_balance_pct",
+                                  "spectral_centroid_hz")})
+                except Exception as e:
+                    entry["error"] = f"couldn't read {s['Location']}: {e}"
+                out.append(entry)
+        return out
+    return await anyio.to_thread.run_sync(run)
+
+
+@tool
+async def place_sound(
+    sound_id: int,
+    track: TrackRef = "SFX",
+    start_beat: float | None = None,
+    at_marker: str | None = None,
+    offset_beats: float = 0,
+    copy_into_project: bool = True,
+) -> dict:
+    """Put a Soundly sound on the REAPER timeline.
+
+    Position with `start_beat`, or `at_marker` (marker/region name, e.g. 'Drop') plus `offset_beats`
+    (negative to land before it, e.g. -2 for a riser into the drop). Defaults to the edit cursor.
+    The track is created if it doesn't exist. With `copy_into_project`, the file is copied to
+    <project>/SFX first so the session stays portable.
+    """
+    beat = await _resolve_beat(start_beat, at_marker, offset_beats)
+    if beat is not None and beat < 0:
+        raise ValueError("that position lands before the project start")
+    track = await _ensure_track(track)
+
+    proj_dir = (await call("get_project")).get("project_path") if copy_into_project else None
+
+    def prepare():
+        with _soundly() as db:
+            s = db.get(sound_id)
+            if not s:
+                raise ValueError(f"no sound with id {sound_id}")
+            path = str(db.copy_file(sound_id, Path(proj_dir) / "SFX")) if proj_dir else s["Location"]
+            return s, path
+
+    s, path = await anyio.to_thread.run_sync(prepare)
+    item = await call("import_audio", track=track, path=path, start_beat=beat)
+    return {"sound": s["Description"], "file": path, "track": track, "item": item}
+
+
+# ---------------------------------------------------------------------------
 # Tempo, markers, arrangement, transport
 # ---------------------------------------------------------------------------
 
@@ -419,6 +559,15 @@ def arrange_song(genre: str = "pop") -> str:
             "(sections, lengths, what enters or drops out where, energy curve), then lay it out with "
             "create_arrangement. Suggest one or two new parts that would lift the chorus or drop, and "
             "write them once I agree.")
+
+
+@mcp.prompt()
+def sound_design(moment: str = "the drop") -> str:
+    """Find and place sound effects from Soundly for a moment in the song."""
+    return (f"Look at my REAPER project's markers and arrangement, then suggest sound design for {moment} "
+            "(risers, impacts, whooshes, textures, whatever suits the genre). For each idea, search my Soundly "
+            "library with several phrasings, inspect the strongest candidates, and give me two options with "
+            "why each works. Place the ones I pick on an 'SFX' track, timed to the marker.")
 
 
 @mcp.prompt()
